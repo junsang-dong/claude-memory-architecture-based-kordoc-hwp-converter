@@ -67,8 +67,9 @@ npm run preview
 ## Vercel 배포
 
 1. 이 저장소를 Vercel 프로젝트로 연결합니다.
-2. **Settings → Environment Variables**에 `ANTHROPIC_API_KEY`를 등록합니다.
+2. **Settings → Environment Variables**에 `ANTHROPIC_API_KEY`를 등록합니다. 값은 **Production**(및 Preview 필요 시) 환경에도 반영했는지 확인하세요.
 3. 배포 후 동일한 UI에서 파일 업로드 → `/api/convert`가 서버리스에서 실행됩니다.
+4. AI 단계 오류가 나면 Vercel **Functions → 로그**에서 `[convert]`로 시작하는 메시지를 확인하세요.
 
 ## 프로젝트 구조 (요약)
 

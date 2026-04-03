@@ -1,7 +1,12 @@
 import Busboy from "busboy";
 import { Readable } from "node:stream";
-import { parse } from "kordoc";
 import Anthropic from "@anthropic-ai/sdk";
+
+/** kordoc는 로드 시 pdfjs-dist를 끌어옵니다. 정적 import는 Vercel 번들/추적 누락 시 프로세스가 바로 죽을 수 있어 동적 import로 감쌉니다. */
+async function loadKordocParse() {
+  const mod = await import("kordoc");
+  return mod.parse;
+}
 
 const MAX_BYTES = 10 * 1024 * 1024;
 /** Claude 입력 상한(대략 토큰·지연 방지). kordoc 전체 텍스트는 여전히 클라이언트 응답용으로 사용 가능 */
@@ -356,10 +361,25 @@ async function handleConvert(req, res) {
     return;
   }
 
+  let parseFn;
+  try {
+    parseFn = await loadKordocParse();
+  } catch (e) {
+    console.error("[convert] kordoc_import", e);
+    sendJson(res, 500, {
+      error:
+        "문서 파서(kordoc)를 불러오지 못했습니다. 보통은 배포 번들에 pdfjs-dist 파일이 빠져 있을 때 발생합니다.",
+      code: "KORDOC_IMPORT",
+      detail: sanitizeDetail(e?.message || String(e)),
+      hint: "vercel.json의 includeFiles에 node_modules/pdfjs-dist/** 가 포함됐는지 확인하세요.",
+    });
+    return;
+  }
+
   const u8 = new Uint8Array(file.buffer);
   let parsed;
   try {
-    parsed = await parse(u8);
+    parsed = await parseFn(u8);
   } catch (e) {
     console.error("[convert] kordoc_throw", e);
     sendJson(res, 500, {

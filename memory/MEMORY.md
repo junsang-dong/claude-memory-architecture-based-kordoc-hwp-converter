@@ -2,7 +2,7 @@
 
 ## 마지막 업데이트
 
-2026-04-03 / Vercel: Claude 순차 호출 → 병렬 + 입력 길이 제한 + 모델 폴백·로그로 AI 단계 안정화
+2026-04-03 / Vercel FUNCTION_INVOCATION_FAILED: pdfjs-dist `includeFiles` + kordoc 동적 import, 리전 icn1·nodejs22.x
 
 ## 프로젝트 목적
 

@@ -71,6 +71,10 @@ npm run preview
 3. 배포 후 동일한 UI에서 파일 업로드 → `/api/convert`가 서버리스에서 실행됩니다.
 4. AI 단계 오류가 나면 Vercel **Functions → 로그**에서 `[convert]`로 시작하는 메시지를 확인하세요.
 
+### `FUNCTION_INVOCATION_FAILED` / HTTP 500 + HTML 본문
+
+kordoc은 내부에서 **pdfjs-dist**(용량 큼, `.mjs`·cmap 다수)를 함께 올립니다. Vercel이 서버리스 번들을 만들 때 이 파일 일부가 빠지면 **함수 프로세스가 곧바로 종료**되어 플랫폼 기본 HTML(`A server error has occurred`)만 돌아올 수 있습니다. 이 저장소의 `vercel.json`에는 `includeFiles: node_modules/pdfjs-dist/**` 가 들어 있으며, `api/convert.js`는 kordoc을 **동적 import**해 로드 실패 시 JSON으로 원인을 돌려주도록 되어 있습니다.
+
 ## 프로젝트 구조 (요약)
 
 ```

@@ -3,7 +3,12 @@ import { parse } from "kordoc";
 import Anthropic from "@anthropic-ai/sdk";
 
 const MAX_BYTES = 10 * 1024 * 1024;
+/** Claude 입력 상한(대략 토큰·지연 방지). kordoc 전체 텍스트는 여전히 클라이언트 응답용으로 사용 가능 */
+const MAX_CLAUDE_INPUT_CHARS = 140_000;
 const ALLOWED_EXT = new Set([".hwp", ".hwpx", ".pdf"]);
+
+const DEFAULT_MODEL = "claude-sonnet-4-20250514";
+const FALLBACK_MODEL = "claude-3-5-sonnet-20241022";
 
 const CONVERT_PROMPT = `당신은 한국어 문서 전문가입니다.
 아래 텍스트는 한글(HWP) 문서에서 추출한 원문입니다.
@@ -84,6 +89,14 @@ function parseErrorToMessage(parseResult) {
   return "파일을 읽을 수 없습니다. 파일이 손상되었을 수 있습니다.";
 }
 
+function clipForClaude(text) {
+  if (text.length <= MAX_CLAUDE_INPUT_CHARS) return text;
+  return (
+    text.slice(0, MAX_CLAUDE_INPUT_CHARS) +
+    "\n\n[… 이하 생략 — 문서가 길어 앞부분만 AI에 전달했습니다.]"
+  );
+}
+
 async function callClaude(client, model, { system, user }, retries = 1) {
   let lastErr;
   for (let attempt = 0; attempt <= retries; attempt++) {
@@ -115,6 +128,36 @@ function extractJsonObject(text) {
   return JSON.parse(raw.slice(start, end + 1));
 }
 
+function logClaudeError(stage, err) {
+  const status = err?.status ?? err?.error?.status;
+  const type = err?.error?.type ?? err?.type;
+  console.error(
+    `[convert] ${stage}`,
+    status ?? "",
+    type ?? "",
+    err?.message ?? err,
+  );
+}
+
+async function callClaudeWithModelFallback(client, model, opts) {
+  try {
+    return await callClaude(client, model, opts);
+  } catch (e) {
+    const status = e?.status ?? e?.error?.status;
+    const msg = String(e?.message ?? "").toLowerCase();
+    const modelNotFound =
+      status === 404 ||
+      msg.includes("not_found_error") ||
+      msg.includes("model:") ||
+      msg.includes("invalid model");
+    if (model !== FALLBACK_MODEL && modelNotFound) {
+      console.warn("[convert] model fallback:", model, "→", FALLBACK_MODEL);
+      return await callClaude(client, FALLBACK_MODEL, opts);
+    }
+    throw e;
+  }
+}
+
 export default async function handler(req, res) {
   res.setHeader("Content-Type", "application/json; charset=utf-8");
 
@@ -130,16 +173,19 @@ export default async function handler(req, res) {
     return;
   }
 
-  const apiKey = process.env.ANTHROPIC_API_KEY;
+  const apiKey = (process.env.ANTHROPIC_API_KEY || "").trim();
   if (!apiKey) {
     res.statusCode = 500;
     res.end(JSON.stringify({ error: "서버에 ANTHROPIC_API_KEY가 설정되지 않았습니다." }));
     return;
   }
 
-  const model =
-    process.env.ANTHROPIC_MODEL || "claude-sonnet-4-20250514";
-  const client = new Anthropic({ apiKey });
+  const model = (process.env.ANTHROPIC_MODEL || "").trim() || DEFAULT_MODEL;
+  const client = new Anthropic({
+    apiKey,
+    /** Vercel 함수 한도 안에서 끝나도록(플랫폼 타임아웃 전 SDK 대기 상한) */
+    timeout: 55_000,
+  });
 
   let files;
   try {
@@ -208,30 +254,26 @@ export default async function handler(req, res) {
     return;
   }
 
+  const textForClaude = clipForClaude(rawText);
+  const analysisSystem =
+    "당신은 문서 분석기입니다. 반드시 유효한 JSON만 출력하세요.";
+
   let markdownResult;
   let analysisResult;
   try {
-    markdownResult = await callClaude(client, model, {
-      user: `${CONVERT_PROMPT}\n\n${rawText}`,
-    });
-  } catch {
-    res.statusCode = 500;
-    res.end(
-      JSON.stringify({
-        error:
-          "AI 분석 중 오류가 발생했습니다. 다시 시도해주세요.",
+    const [mdText, analysisText] = await Promise.all([
+      callClaudeWithModelFallback(client, model, {
+        user: `${CONVERT_PROMPT}\n\n${textForClaude}`,
       }),
-    );
-    return;
-  }
-
-  try {
-    const analysisText = await callClaude(client, model, {
-      system: "당신은 문서 분석기입니다. 반드시 유효한 JSON만 출력하세요.",
-      user: `${ANALYSIS_PROMPT}\n\n${rawText}`,
-    });
+      callClaudeWithModelFallback(client, model, {
+        system: analysisSystem,
+        user: `${ANALYSIS_PROMPT}\n\n${textForClaude}`,
+      }),
+    ]);
+    markdownResult = mdText;
     analysisResult = extractJsonObject(analysisText);
-  } catch {
+  } catch (e) {
+    logClaudeError("claude_parallel", e);
     res.statusCode = 500;
     res.end(
       JSON.stringify({

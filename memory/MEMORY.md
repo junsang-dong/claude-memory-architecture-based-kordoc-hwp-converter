@@ -2,7 +2,7 @@
 
 ## 마지막 업데이트
 
-2026-04-03 / Vite React 프론트 + Vercel `api/convert.js`(kordoc + Claude) MVP 구현
+2026-04-03 / Vercel: Claude 순차 호출 → 병렬 + 입력 길이 제한 + 모델 폴백·로그로 AI 단계 안정화
 
 ## 프로젝트 목적
 

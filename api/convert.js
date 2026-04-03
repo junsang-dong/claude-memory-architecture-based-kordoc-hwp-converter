@@ -1,4 +1,5 @@
 import Busboy from "busboy";
+import { Readable } from "node:stream";
 import { parse } from "kordoc";
 import Anthropic from "@anthropic-ai/sdk";
 
@@ -41,10 +42,120 @@ function extname(filename) {
   return i >= 0 ? filename.slice(i).toLowerCase() : "";
 }
 
-function parseMultipart(req) {
+function sendJson(res, statusCode, payload) {
+  res.statusCode = statusCode;
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
+  res.end(JSON.stringify(payload));
+}
+
+/** 응답에 API 키 같은 비밀이 섞이지 않도록 */
+function sanitizeDetail(s) {
+  if (s == null) return "";
+  return String(s).replace(/sk-ant-[a-zA-Z0-9\-_]{10,}/g, "[API_KEY_REDACTED]");
+}
+
+function anthropicErrToPayload(err) {
+  const status = err?.status;
+  const api = err?.error;
+  const inner = api?.error;
+  const type = inner?.type ?? api?.type ?? err?.type;
+  const rawMsg = sanitizeDetail(
+    inner?.message ?? api?.message ?? err?.message ?? String(err),
+  );
+
+  if (type === "authentication_error" || status === 401) {
+    return {
+      error:
+        "Anthropic API 인증에 실패했습니다. Vercel 환경 변수 ANTHROPIC_API_KEY(Production)가 올바른지 확인하세요.",
+      code: "ANTHROPIC_AUTH",
+      detail: rawMsg || "invalid x-api-key 또는 키 누락",
+      hint: "키 앞뒤 공백·따옴표 포함 여부, Production/Preview 환경 별도 설정 여부를 확인하세요.",
+    };
+  }
+
+  if (type === "permission_error" || status === 403) {
+    return {
+      error: "Anthropic API 권한이 없습니다.",
+      code: "ANTHROPIC_PERMISSION",
+      detail: rawMsg,
+    };
+  }
+
+  if (type === "rate_limit_error" || status === 429) {
+    return {
+      error: "Anthropic API 요청 한도에 걸렸습니다. 잠시 후 다시 시도해주세요.",
+      code: "ANTHROPIC_RATE_LIMIT",
+      detail: rawMsg,
+    };
+  }
+
+  if (type === "not_found_error" || status === 404) {
+    return {
+      error: "요청한 모델 또는 리소스를 찾을 수 없습니다.",
+      code: "ANTHROPIC_NOT_FOUND",
+      detail: rawMsg,
+      hint: `ANTHROPIC_MODEL을 비우거나 ${FALLBACK_MODEL} 등 지원 모델로 설정해 보세요.`,
+    };
+  }
+
+  if (type === "invalid_request_error" || status === 400) {
+    return {
+      error: "Anthropic API 요청 형식이 올바르지 않습니다.",
+      code: "ANTHROPIC_BAD_REQUEST",
+      detail: rawMsg,
+    };
+  }
+
+  if (type === "overloaded_error" || status === 529) {
+    return {
+      error: "Anthropic API가 과부하 상태입니다. 잠시 후 다시 시도해주세요.",
+      code: "ANTHROPIC_OVERLOADED",
+      detail: rawMsg,
+    };
+  }
+
+  if (type === "billing_error") {
+    return {
+      error: "Anthropic 과금·크레딧 쪽 문제로 요청이 거절되었습니다.",
+      code: "ANTHROPIC_BILLING",
+      detail: rawMsg,
+    };
+  }
+
+  return {
+    error: "Claude API 호출 중 오류가 발생했습니다.",
+    code: type || "ANTHROPIC_ERROR",
+    detail: rawMsg,
+    httpStatus: status,
+  };
+}
+
+async function readRequestBodyBuffer(req) {
+  if (Buffer.isBuffer(req.body)) {
+    return req.body;
+  }
+  if (typeof req.body === "string") {
+    return Buffer.from(req.body, "utf8");
+  }
+  if (req.body instanceof Uint8Array) {
+    return Buffer.from(req.body);
+  }
+
+  const chunks = [];
+  await new Promise((resolve, reject) => {
+    req.on("data", (chunk) => {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    });
+    req.on("end", resolve);
+    req.on("error", reject);
+  });
+  return Buffer.concat(chunks);
+}
+
+function parseMultipartBuffer(buffer, headers) {
   return new Promise((resolve, reject) => {
     const bb = Busboy({
-      headers: req.headers,
+      headers,
       limits: { fileSize: MAX_BYTES },
     });
     const files = [];
@@ -71,8 +182,18 @@ function parseMultipart(req) {
 
     bb.on("error", reject);
     bb.on("finish", () => resolve(files));
-    req.pipe(bb);
+    Readable.from(buffer).pipe(bb);
   });
+}
+
+async function parseMultipart(req) {
+  const buffer = await readRequestBodyBuffer(req);
+  if (!buffer.length) {
+    const err = new Error("EMPTY_MULTIPART_BODY");
+    err.code = "EMPTY_BODY";
+    throw err;
+  }
+  return parseMultipartBuffer(buffer, req.headers);
 }
 
 function parseErrorToMessage(parseResult) {
@@ -129,8 +250,8 @@ function extractJsonObject(text) {
 }
 
 function logClaudeError(stage, err) {
-  const status = err?.status ?? err?.error?.status;
-  const type = err?.error?.type ?? err?.type;
+  const status = err?.status;
+  const type = err?.error?.error?.type ?? err?.error?.type;
   console.error(
     `[convert] ${stage}`,
     status ?? "",
@@ -158,9 +279,7 @@ async function callClaudeWithModelFallback(client, model, opts) {
   }
 }
 
-export default async function handler(req, res) {
-  res.setHeader("Content-Type", "application/json; charset=utf-8");
-
+async function handleConvert(req, res) {
   if (req.method === "OPTIONS") {
     res.statusCode = 204;
     res.end();
@@ -168,23 +287,24 @@ export default async function handler(req, res) {
   }
 
   if (req.method !== "POST") {
-    res.statusCode = 405;
-    res.end(JSON.stringify({ error: "Method not allowed" }));
+    sendJson(res, 405, { error: "Method not allowed", code: "METHOD_NOT_ALLOWED" });
     return;
   }
 
   const apiKey = (process.env.ANTHROPIC_API_KEY || "").trim();
   if (!apiKey) {
-    res.statusCode = 500;
-    res.end(JSON.stringify({ error: "서버에 ANTHROPIC_API_KEY가 설정되지 않았습니다." }));
+    sendJson(res, 500, {
+      error: "서버에 ANTHROPIC_API_KEY가 설정되지 않았습니다.",
+      code: "MISSING_ANTHROPIC_API_KEY",
+      detail: "Vercel → Settings → Environment Variables 에서 Production 환경에도 추가했는지 확인하세요.",
+    });
     return;
   }
 
   const model = (process.env.ANTHROPIC_MODEL || "").trim() || DEFAULT_MODEL;
   const client = new Anthropic({
     apiKey,
-    /** Vercel 함수 한도 안에서 끝나도록(플랫폼 타임아웃 전 SDK 대기 상한) */
-    timeout: 55_000,
+    timeout: 120_000,
   });
 
   let files;
@@ -192,28 +312,47 @@ export default async function handler(req, res) {
     files = await parseMultipart(req);
   } catch (e) {
     if (e.code === "FILE_TOO_LARGE") {
-      res.statusCode = 413;
-      res.end(JSON.stringify({ error: "10MB 이하 파일만 업로드 가능합니다." }));
+      sendJson(res, 413, {
+        error: "10MB 이하 파일만 업로드 가능합니다.",
+        code: "FILE_TOO_LARGE",
+      });
       return;
     }
-    res.statusCode = 400;
-    res.end(JSON.stringify({ error: "요청 본문을 파싱할 수 없습니다." }));
+    if (e.code === "EMPTY_BODY") {
+      sendJson(res, 400, {
+        error: "업로드 본문이 비어 있습니다.",
+        code: "EMPTY_BODY",
+        detail:
+          "Vercel에서 multipart 스트림이 비어 있는 경우입니다. 네트워크/프록시 또는 요청 크기 제한을 확인하세요.",
+      });
+      return;
+    }
+    console.error("[convert] multipart_parse", e);
+    sendJson(res, 400, {
+      error: "요청 본문을 파싱할 수 없습니다.",
+      code: "MULTIPART_PARSE_ERROR",
+      detail: sanitizeDetail(e.message || String(e)),
+    });
     return;
   }
 
   const file = files[0];
   if (!file?.buffer?.length) {
-    res.statusCode = 400;
-    res.end(JSON.stringify({ error: "파일이 없습니다." }));
+    sendJson(res, 400, {
+      error: "파일이 없습니다.",
+      code: "NO_FILE",
+      detail:
+        "폼 필드 이름은 file이어야 하며, multipart가 올바른지 확인하세요.",
+    });
     return;
   }
 
   const ext = extname(file.filename || "");
   if (!ALLOWED_EXT.has(ext)) {
-    res.statusCode = 400;
-    res.end(
-      JSON.stringify({ error: "HWP, HWPX, PDF 파일만 가능합니다." }),
-    );
+    sendJson(res, 400, {
+      error: "HWP, HWPX, PDF 파일만 가능합니다.",
+      code: "UNSUPPORTED_EXT",
+    });
     return;
   }
 
@@ -221,36 +360,31 @@ export default async function handler(req, res) {
   let parsed;
   try {
     parsed = await parse(u8);
-  } catch {
-    res.statusCode = 500;
-    res.end(
-      JSON.stringify({
-        error:
-          "파일을 읽을 수 없습니다. 파일이 손상되었을 수 있습니다.",
-      }),
-    );
+  } catch (e) {
+    console.error("[convert] kordoc_throw", e);
+    sendJson(res, 500, {
+      error: "파일을 읽을 수 없습니다. 파일이 손상되었을 수 있습니다.",
+      code: "KORDOC_EXCEPTION",
+      detail: sanitizeDetail(e?.message || String(e)),
+    });
     return;
   }
 
   if (!parsed.success) {
-    res.statusCode = 500;
-    res.end(
-      JSON.stringify({
-        error: parseErrorToMessage(parsed),
-      }),
-    );
+    sendJson(res, 500, {
+      error: parseErrorToMessage(parsed),
+      code: parsed.code || "KORDOC_PARSE_FAILED",
+      detail: sanitizeDetail(parsed.error || ""),
+    });
     return;
   }
 
   const rawText = (parsed.markdown || "").trim();
   if (!rawText) {
-    res.statusCode = 500;
-    res.end(
-      JSON.stringify({
-        error:
-          "파일을 읽을 수 없습니다. 파일이 손상되었을 수 있습니다.",
-      }),
-    );
+    sendJson(res, 500, {
+      error: "파일을 읽을 수 없습니다. 파일이 손상되었을 수 있습니다.",
+      code: "EMPTY_MARKDOWN",
+    });
     return;
   }
 
@@ -258,29 +392,46 @@ export default async function handler(req, res) {
   const analysisSystem =
     "당신은 문서 분석기입니다. 반드시 유효한 JSON만 출력하세요.";
 
-  let markdownResult;
+  const mdPromise = callClaudeWithModelFallback(client, model, {
+    user: `${CONVERT_PROMPT}\n\n${textForClaude}`,
+  });
+  const analysisPromise = callClaudeWithModelFallback(client, model, {
+    system: analysisSystem,
+    user: `${ANALYSIS_PROMPT}\n\n${textForClaude}`,
+  });
+
+  const settled = await Promise.allSettled([mdPromise, analysisPromise]);
+
+  if (settled[0].status === "rejected") {
+    const err = settled[0].reason;
+    logClaudeError("claude_markdown", err);
+    const payload = anthropicErrToPayload(err);
+    sendJson(res, 500, payload);
+    return;
+  }
+
+  if (settled[1].status === "rejected") {
+    const err = settled[1].reason;
+    logClaudeError("claude_analysis", err);
+    const payload = anthropicErrToPayload(err);
+    sendJson(res, 500, payload);
+    return;
+  }
+
+  const markdownResult = settled[0].value;
+  const analysisText = settled[1].value;
+
   let analysisResult;
   try {
-    const [mdText, analysisText] = await Promise.all([
-      callClaudeWithModelFallback(client, model, {
-        user: `${CONVERT_PROMPT}\n\n${textForClaude}`,
-      }),
-      callClaudeWithModelFallback(client, model, {
-        system: analysisSystem,
-        user: `${ANALYSIS_PROMPT}\n\n${textForClaude}`,
-      }),
-    ]);
-    markdownResult = mdText;
     analysisResult = extractJsonObject(analysisText);
   } catch (e) {
-    logClaudeError("claude_parallel", e);
-    res.statusCode = 500;
-    res.end(
-      JSON.stringify({
-        error:
-          "AI 분석 중 오류가 발생했습니다. 다시 시도해주세요.",
-      }),
-    );
+    console.error("[convert] analysis_json_parse", e, analysisText?.slice?.(0, 400));
+    sendJson(res, 500, {
+      error: "분석 결과 JSON을 해석할 수 없습니다. 모델 응답 형식을 확인하세요.",
+      code: "ANALYSIS_JSON_PARSE",
+      detail: sanitizeDetail(e.message || String(e)),
+      snippet: sanitizeDetail(analysisText?.slice?.(0, 800) || ""),
+    });
     return;
   }
 
@@ -302,11 +453,21 @@ export default async function handler(req, res) {
     ...(pageCount != null ? { page_count: pageCount } : {}),
   };
 
-  res.statusCode = 200;
-  res.end(
-    JSON.stringify({
-      markdown: markdownResult || rawText,
-      analysis,
-    }),
-  );
+  sendJson(res, 200, {
+    markdown: markdownResult || rawText,
+    analysis,
+  });
+}
+
+export default async function handler(req, res) {
+  try {
+    await handleConvert(req, res);
+  } catch (e) {
+    console.error("[convert] unhandled", e);
+    sendJson(res, 500, {
+      error: "서버 내부 오류가 발생했습니다.",
+      code: "UNHANDLED",
+      detail: sanitizeDetail(e?.message || String(e)),
+    });
+  }
 }

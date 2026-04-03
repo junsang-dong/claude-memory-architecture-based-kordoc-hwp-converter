@@ -47,21 +47,39 @@ export function useConvert() {
         body: formData,
       });
 
-      const data = await res.json().catch(() => ({}));
+      const rawText = await res.text();
+      let data = {};
+      try {
+        data = rawText ? JSON.parse(rawText) : {};
+      } catch {
+        data = {
+          error: `서버 응답을 JSON으로 읽을 수 없습니다 (HTTP ${res.status})`,
+          code: "BAD_RESPONSE",
+          detail: rawText.slice(0, 800),
+        };
+      }
 
       if (!res.ok) {
-        setError(
-          data.error ||
-            "AI 분석 중 오류가 발생했습니다. 다시 시도해주세요.",
-        );
+        const lines = [
+          data.error || `요청 실패 (HTTP ${res.status})`,
+          data.code ? `코드: ${data.code}` : null,
+          data.detail ? `상세: ${data.detail}` : null,
+          data.hint ? `안내: ${data.hint}` : null,
+          data.snippet ? `응답 일부: ${data.snippet}` : null,
+        ].filter(Boolean);
+        setError(lines.join("\n"));
         setStatus("error");
         return;
       }
 
       setResult(data);
       setStatus("success");
-    } catch {
-      setError("네트워크 연결을 확인해주세요");
+    } catch (e) {
+      setError(
+        e instanceof Error
+          ? `네트워크 오류: ${e.message}`
+          : "네트워크 연결을 확인해주세요",
+      );
       setStatus("error");
     }
   }, []);

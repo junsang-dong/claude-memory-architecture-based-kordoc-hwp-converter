@@ -120,6 +120,8 @@ body {
 
 .status-message.error {
   color: var(--error);
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .status-message.success {

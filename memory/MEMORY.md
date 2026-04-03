@@ -2,7 +2,7 @@
 
 ## 마지막 업데이트
 
-2026-04-03 / Vercel FUNCTION_INVOCATION_FAILED: pdfjs-dist `includeFiles` + kordoc 동적 import, 리전 icn1·nodejs22.x
+2026-04-03 / Vercel: vercel.json에 Node `runtime` 금지(커뮤니티 런타임 전용)—Node 버전은 package.json engines만 사용
 
 ## 프로젝트 목적
 
